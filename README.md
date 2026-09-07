@@ -163,14 +163,18 @@ JSON Schema `$ref` nodes in tool definitions. These workarounds are opt-in
 because schema stripping is provider-specific and can change tool semantics:
 
 ```bash
-CODEX_RELAY_OPENCODE_GO_COMPAT=1 \
+CODEX_RELAY_OPENCODE_GO_COMPAT=true \
   codex-relay --upstream https://opencode.ai/zen/go/v1 --api-key "$OPENCODE_GO_API_KEY"
 ```
 
-The feature converts orphan tool outputs into developer messages before the
-normal Responses-to-Chat-Completions translation and removes only the affected
-`$ref` schema nodes. It logs how many nodes were changed without logging
-request content or credentials.
+The feature forwards Muse requests to OpenCode Go's native `/responses`
+endpoint. It converts orphan tool outputs and custom tools into supported
+Responses items, flattens namespace tools, removes unsupported built-in tool
+fields and recursive `$ref` schema nodes, and drops `reasoning.effort=none`.
+It logs only change counts, without request content or credentials. The relay
+also forwards an incoming `x-opencode-session` header, or generates a bounded
+stable fallback and binds it to the upstream response ID for subsequent
+`previous_response_id` requests.
 
 Some providers need workarounds that are not part of the Responses ⇄ Chat Completions translation itself. These are registered as named quirks (see `src/quirks.rs` for the full registry, triggers, and removal criteria):
 

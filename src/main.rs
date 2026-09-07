@@ -10,8 +10,9 @@ mod upstream_request;
 
 use anyhow::{bail, Context, Result};
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -20,7 +21,14 @@ use clap::Parser;
 use corpus::CorpusRecorder;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tracing::{debug, error, info, warn};
 use types::*;
 use upstream_request::UpstreamRequestConfig;
@@ -137,6 +145,61 @@ struct AppState {
     upstream_request: Arc<UpstreamRequestConfig>,
     corpus: Option<CorpusRecorder>,
     opencode_go_compat: bool,
+    opencode_sessions: OpenCodeSessionRegistry,
+}
+
+#[derive(Clone)]
+struct OpenCodeSessionRegistry {
+    state: Arc<Mutex<OpenCodeSessionState>>,
+    max_entries: usize,
+}
+
+struct OpenCodeSessionState {
+    by_response: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl OpenCodeSessionRegistry {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(OpenCodeSessionState {
+                by_response: HashMap::new(),
+                order: VecDeque::new(),
+            })),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    fn session_for_request(&self, previous_response_id: Option<&str>, fallback: String) -> String {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        previous_response_id
+            .and_then(|id| state.by_response.get(id))
+            .cloned()
+            .unwrap_or(fallback)
+    }
+
+    fn bind(&self, response_id: String, session_id: String) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .by_response
+            .insert(response_id.clone(), session_id)
+            .is_some()
+        {
+            state.order.retain(|id| id != &response_id);
+        }
+        state.order.push_back(response_id);
+        while state.order.len() > self.max_entries {
+            if let Some(oldest) = state.order.pop_front() {
+                state.by_response.remove(&oldest);
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -220,6 +283,7 @@ async fn main() -> Result<()> {
         upstream_request: upstream_request.clone(),
         corpus,
         opencode_go_compat: args.opencode_go_compat,
+        opencode_sessions: OpenCodeSessionRegistry::new(args.max_sessions),
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -771,9 +835,13 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
-    let req: ResponsesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
+async fn handle_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
         Err(e) => {
             error!(
                 error_category = ?e.classify(),
@@ -782,6 +850,13 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
                 body_bytes = body.len(),
                 "JSON parse error"
             );
+            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
+        }
+    };
+    let req: ResponsesRequest = match serde_json::from_value(payload.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("request shape parse error: {e}");
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }
     };
@@ -801,7 +876,151 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
+    let incoming_opencode_session = headers
+        .get("x-opencode-session")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+
+    if state.opencode_go_compat {
+        return handle_opencode_responses(state, payload, req, headers, incoming_opencode_session)
+            .await;
+    }
+
     handle_responses_inner(state, req).await
+}
+
+async fn handle_opencode_responses(
+    state: AppState,
+    mut payload: serde_json::Value,
+    req: ResponsesRequest,
+    headers: HeaderMap,
+    incoming_opencode_session: Option<String>,
+) -> Response {
+    let (normalized_outputs, stripped_refs, stripped_fields) =
+        translate::normalize_opencode_go_responses_payload(&mut payload);
+    if normalized_outputs > 0 {
+        warn!(
+            "opencode_go_compat normalized {} orphan function_call_output item(s)",
+            normalized_outputs
+        );
+    }
+    if stripped_refs > 0 {
+        warn!(
+            "opencode_go_compat stripped {} tool schema $ref node(s)",
+            stripped_refs
+        );
+    }
+    if stripped_fields > 0 {
+        warn!(
+            "opencode_go_compat stripped {} unsupported tool field(s)",
+            stripped_fields
+        );
+    }
+
+    let session_id = incoming_opencode_session.unwrap_or_else(|| {
+        state.opencode_sessions.session_for_request(
+            req.previous_response_id.as_deref(),
+            translate::opencode_session_id_for_request(&req),
+        )
+    });
+    let url = format!("{}responses", join_base(&state.upstream));
+    let mut builder = state
+        .client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header(
+            "Accept",
+            if req.stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .header(
+            "User-Agent",
+            format!("codex-relay/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header("x-opencode-session", session_id.as_str());
+    if !state.api_key.is_empty() {
+        builder = builder.bearer_auth(state.api_key.as_str());
+    }
+    for name in ["OpenAI-Beta", "OpenAI-Organization", "OpenAI-Project"] {
+        if let Some(value) = headers.get(name) {
+            builder = builder.header(name, value);
+        }
+    }
+
+    let upstream = match builder.json(&payload).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            error!("OpenCode Go Responses request failed: {e}");
+            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+        }
+    };
+    let status = upstream.status();
+    let content_type = upstream.headers().get("content-type").cloned();
+    let body = match upstream.bytes().await {
+        Ok(body) => body,
+        Err(e) => {
+            error!("OpenCode Go Responses body read failed: {e}");
+            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+        }
+    };
+    if !status.is_success() {
+        error!("upstream {status}: OpenCode Go Responses request failed");
+        return (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        )
+            .into_response();
+    }
+
+    if let Some(response_id) = opencode_response_id(&body, req.stream) {
+        state
+            .opencode_sessions
+            .bind(response_id, session_id.to_owned());
+    }
+
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        response = response.header("content-type", content_type);
+    }
+    response
+        .body(Body::from(body))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+fn opencode_response_id(body: &[u8], stream: bool) -> Option<String> {
+    if !stream {
+        return serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+    }
+
+    body.split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data:"))
+        .filter_map(|data| {
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            serde_json::from_slice::<serde_json::Value>(data).ok()
+        })
+        .find_map(|event| {
+            (event.get("type").and_then(serde_json::Value::as_str) == Some("response.created"))
+                .then(|| {
+                    event
+                        .get("response")
+                        .and_then(|response| response.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
 }
 
 async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {
@@ -852,8 +1071,8 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
     let previous_response_id = req.previous_response_id.clone();
+    let response_id = state.sessions.new_id();
     if req.stream {
-        let response_id = state.sessions.new_id();
         chat_req.stream = true;
         let request_messages = chat_req.messages.clone();
         stream::translate_stream(stream::StreamArgs {
@@ -882,6 +1101,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
             namespace_tools,
             custom_tools,
             previous_response_id,
+            response_id,
         )
         .await
     }
@@ -1186,6 +1406,7 @@ async fn handle_blocking(
     namespace_tools: translate::NamespaceToolMap,
     custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
+    response_id: String,
 ) -> Response {
     let mut builder = state
         .client
@@ -1249,7 +1470,6 @@ async fn handle_blocking(
                         "← upstream function_calls={}",
                         summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
                     );
-                    let response_id = state.sessions.new_id();
                     let (resp, assistant_messages) =
                         if namespace_tools.is_empty() && custom_tools.is_empty() {
                             translate::from_chat_response(response_id.clone(), &model, chat_resp)

@@ -21,6 +21,7 @@
 
 use codex_relay::session::SessionStore;
 use codex_relay::translate::{
+    normalize_opencode_go_responses_payload, opencode_session_id_for_request,
     strip_tool_schema_refs, to_chat_request, to_chat_request_with_options, TranslateOptions,
 };
 use codex_relay::types::ResponsesRequest;
@@ -177,5 +178,67 @@ fn opencode_go_compat_strips_tool_schema_refs() {
     assert_eq!(
         tools[0]["parameters"]["properties"]["child"],
         serde_json::json!({})
+    );
+}
+
+#[test]
+fn opencode_session_fallback_is_stable_for_the_same_first_message() {
+    let first: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "muse-spark-1.3-contributor",
+        "input": "hello"
+    }))
+    .unwrap();
+    let second: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "muse-spark-1.3-contributor",
+        "input": "hello"
+    }))
+    .unwrap();
+
+    assert_eq!(
+        opencode_session_id_for_request(&first),
+        opencode_session_id_for_request(&second)
+    );
+}
+
+#[test]
+fn opencode_go_compat_strips_invalid_search_content_types() {
+    let mut payload = serde_json::json!({
+        "input": "hello",
+        "tools": [{
+            "type": "web_search",
+            "search_content_types": ["text"]
+        }]
+    });
+
+    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
+    assert_eq!(stripped_fields, 1);
+    assert!(payload["tools"][0].get("search_content_types").is_none());
+}
+
+#[test]
+fn opencode_go_compat_strips_unsupported_none_reasoning_effort() {
+    let mut payload = serde_json::json!({
+        "input": "hello",
+        "reasoning": {"effort": "none"}
+    });
+
+    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
+    assert_eq!(stripped_fields, 1);
+    assert!(payload.get("reasoning").is_none());
+}
+
+#[test]
+fn opencode_go_compat_converts_custom_tools_to_function_tools() {
+    let mut payload = serde_json::json!({
+        "input": "hello",
+        "tools": [{"type": "custom", "name": "apply_patch"}]
+    });
+
+    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
+    assert_eq!(stripped_fields, 1);
+    assert_eq!(payload["tools"][0]["type"], "function");
+    assert_eq!(
+        payload["tools"][0]["parameters"]["properties"]["patch"]["type"],
+        "string"
     );
 }
