@@ -80,6 +80,8 @@ env_key = "DEEPSEEK_API_KEY"
 | `--bind` | `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `--upstream` | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
+| `--opencode-go-compat` | `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
+| `--max-request-bytes` | `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
 | `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request |
 | `--drop-upstream-params` | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameters to remove |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
@@ -136,6 +138,8 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
+| `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
+| `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
 | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request body |
 | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameter names to remove before forwarding |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
@@ -150,6 +154,23 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Platform quirks
+
+### OpenCode Go compatibility
+
+OpenCode Go can reject two otherwise valid Codex request patterns: standalone
+`function_call_output` items without a `call_id`, and recursive or unsupported
+JSON Schema `$ref` nodes in tool definitions. These workarounds are opt-in
+because schema stripping is provider-specific and can change tool semantics:
+
+```bash
+CODEX_RELAY_OPENCODE_GO_COMPAT=1 \
+  codex-relay --upstream https://opencode.ai/zen/go/v1 --api-key "$OPENCODE_GO_API_KEY"
+```
+
+The feature converts orphan tool outputs into developer messages before the
+normal Responses-to-Chat-Completions translation and removes only the affected
+`$ref` schema nodes. It logs how many nodes were changed without logging
+request content or credentials.
 
 Some providers need workarounds that are not part of the Responses ⇄ Chat Completions translation itself. These are registered as named quirks (see `src/quirks.rs` for the full registry, triggers, and removal criteria):
 

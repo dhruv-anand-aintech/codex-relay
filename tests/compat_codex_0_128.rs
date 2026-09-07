@@ -20,7 +20,9 @@
 //! Live end-to-end coverage against real DeepSeek is in `compat_deepseek_live.rs`.
 
 use codex_relay::session::SessionStore;
-use codex_relay::translate::to_chat_request;
+use codex_relay::translate::{
+    strip_tool_schema_refs, to_chat_request, to_chat_request_with_options, TranslateOptions,
+};
 use codex_relay::types::ResponsesRequest;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -129,4 +131,51 @@ fn unknown_top_level_fields_dont_break_parse() {
     // (Negative coverage — fixture::with_namespace_tool has a few of them.)
     let req = fixture("with_namespace_tool.json");
     assert_eq!(req.model, "deepseek-v4-pro");
+}
+
+#[test]
+fn opencode_go_compat_normalizes_orphan_tool_output() {
+    let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "muse-spark-1.3-contributor",
+        "input": [{
+            "type": "function_call_output",
+            "namespace": "browser",
+            "name": "open",
+            "output": {"text": "done"}
+        }]
+    }))
+    .unwrap();
+
+    let default_chat = to_chat_request(&req, Vec::new(), &SessionStore::new());
+    assert_eq!(default_chat.messages[0].role, "tool");
+    assert_eq!(default_chat.messages[0].tool_call_id.as_deref(), Some(""));
+
+    let chat = to_chat_request_with_options(
+        &req,
+        Vec::new(),
+        &SessionStore::new(),
+        TranslateOptions {
+            opencode_go_compat: true,
+        },
+    );
+    assert_eq!(chat.messages[0].role, "system");
+    assert_eq!(
+        chat.messages[0].text_content(),
+        "[browser/open output]\n{\"text\":\"done\"}"
+    );
+    assert!(chat.messages[0].tool_call_id.is_none());
+}
+
+#[test]
+fn opencode_go_compat_strips_tool_schema_refs() {
+    let mut tools = vec![serde_json::json!({
+        "type": "function",
+        "name": "recursive",
+        "parameters": {"properties": {"child": {"$ref": "#/$defs/Node"}}}
+    })];
+    assert_eq!(strip_tool_schema_refs(&mut tools), 1);
+    assert_eq!(
+        tools[0]["parameters"]["properties"]["child"],
+        serde_json::json!({})
+    );
 }

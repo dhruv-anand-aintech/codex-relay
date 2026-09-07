@@ -26,6 +26,7 @@ use types::*;
 use upstream_request::UpstreamRequestConfig;
 
 const DEBUG_NAME_LIMIT: usize = 80;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +51,18 @@ struct Args {
 
     #[arg(long, env = "CODEX_RELAY_API_KEY", default_value = "")]
     api_key: String,
+
+    /// Enable compatibility workarounds for the OpenCode Go Responses endpoint.
+    #[arg(long, env = "CODEX_RELAY_OPENCODE_GO_COMPAT", default_value_t = false)]
+    opencode_go_compat: bool,
+
+    /// Maximum inbound Responses request size in bytes.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_MAX_REQUEST_BYTES",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES
+    )]
+    max_request_bytes: usize,
 
     /// JSON object merged into every upstream Chat Completions request body.
     #[arg(long, env = "CODEX_RELAY_UPSTREAM_EXTRA_PARAMS")]
@@ -123,6 +136,7 @@ struct AppState {
     api_key: Arc<String>,
     upstream_request: Arc<UpstreamRequestConfig>,
     corpus: Option<CorpusRecorder>,
+    opencode_go_compat: bool,
 }
 
 #[tokio::main]
@@ -205,6 +219,7 @@ async fn main() -> Result<()> {
         api_key: api_key.clone(),
         upstream_request: upstream_request.clone(),
         corpus,
+        opencode_go_compat: args.opencode_go_compat,
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -221,22 +236,23 @@ async fn main() -> Result<()> {
             upstream_request.drop_param_count()
         );
     }
+    if args.opencode_go_compat {
+        info!("OpenCode Go compatibility enabled");
+    }
 
     // Fetch upstream model list asynchronously for user visibility
     tokio::spawn(log_upstream_models(client, Arc::new(upstream), api_key));
 
     tokio::spawn(cleanup_sessions(state.sessions.clone()));
 
-    // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
-    // image attachments that easily exceed it, and a framework-level 413 looks
-    // like a transport-layer death to Codex and crashes the session (#2).
-    // The relay binds 127.0.0.1 by default; --bind can expose it more widely,
-    // so be mindful of DoS when binding to a non-loopback address.
+    // Codex CLI may send base64-encoded image attachments that exceed Axum's
+    // default 2 MiB cap, but an unlimited body is an avoidable DoS risk when
+    // --bind exposes the listener beyond localhost. Keep the cap configurable.
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
         .fallback(handle_fallback)
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(args.max_request_bytes))
         .with_state(state.clone());
 
     let addr = std::net::SocketAddr::new(args.bind, args.port);
@@ -808,7 +824,27 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
     let model = req.model.clone();
     let namespace_tools = translate::namespace_tool_map(&req.tools);
     let custom_tools = translate::custom_tool_map(&req.tools);
-    let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
+    let mut chat_req = if state.opencode_go_compat {
+        translate::to_chat_request_with_options(
+            &req,
+            history,
+            &state.sessions,
+            translate::TranslateOptions {
+                opencode_go_compat: true,
+            },
+        )
+    } else {
+        translate::to_chat_request(&req, history, &state.sessions)
+    };
+    if state.opencode_go_compat {
+        let stripped = translate::strip_tool_schema_refs(&mut chat_req.tools);
+        if stripped > 0 {
+            warn!(
+                "opencode_go_compat stripped {} tool schema $ref node(s)",
+                stripped
+            );
+        }
+    }
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))

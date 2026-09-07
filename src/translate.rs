@@ -19,6 +19,11 @@ pub struct CustomToolName {
 
 pub type CustomToolMap = HashMap<String, CustomToolName>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranslateOptions {
+    pub opencode_go_compat: bool,
+}
+
 /// Reject tool declarations that collapse to the same Chat Completions name.
 /// The `namespace-name` encoding is not reversible on its own; silently
 /// overwriting one identity could route a call to the wrong namespace and, for
@@ -47,6 +52,16 @@ pub fn to_chat_request(
     req: &ResponsesRequest,
     history: Vec<ChatMessage>,
     sessions: &SessionStore,
+) -> ChatRequest {
+    to_chat_request_with_options(req, history, sessions, TranslateOptions::default())
+}
+
+/// Convert a Responses API request with optional provider-specific workarounds.
+pub fn to_chat_request_with_options(
+    req: &ResponsesRequest,
+    history: Vec<ChatMessage>,
+    sessions: &SessionStore,
+    options: TranslateOptions,
 ) -> ChatRequest {
     let mut messages = history;
 
@@ -106,6 +121,12 @@ pub fn to_chat_request(
             messages.push(msg);
         }
         ResponsesInput::Messages(items) => {
+            let normalized_items: Vec<Value> = if options.opencode_go_compat {
+                items.iter().map(normalize_opencode_go_input_item).collect()
+            } else {
+                items.clone()
+            };
+            let items = &normalized_items;
             // Request-scoped custom tool map so replayed custom_tool_call items
             // are wrapped with the same argument field the tool declared.
             let custom_tools = custom_tool_map(&req.tools);
@@ -320,6 +341,56 @@ pub fn to_chat_request(
             .as_ref()
             .and_then(|reasoning| reasoning.effort.clone()),
         stream: req.stream,
+    }
+}
+
+fn normalize_opencode_go_input_item(item: &Value) -> Value {
+    let is_orphan_output = item.get("type").and_then(Value::as_str) == Some("function_call_output")
+        && item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty);
+    if !is_orphan_output {
+        return item.clone();
+    }
+
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let namespace = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let label = namespace.map_or_else(|| name.to_string(), |ns| format!("{ns}/{name}"));
+    let output = response_output_text(item.get("output"));
+    json!({
+        "type": "message",
+        "role": "developer",
+        "content": format!("[{label} output]\n{output}"),
+    })
+}
+
+fn response_output_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Remove `$ref` schema nodes from function tools for providers that reject
+/// recursive or otherwise unsupported JSON Schema references.
+pub fn strip_tool_schema_refs(tools: &mut [Value]) -> usize {
+    tools.iter_mut().map(strip_schema_refs).sum()
+}
+
+fn strip_schema_refs(value: &mut Value) -> usize {
+    match value {
+        Value::Object(object) if object.contains_key("$ref") => {
+            *value = Value::Object(serde_json::Map::new());
+            1
+        }
+        Value::Object(object) => object.values_mut().map(strip_schema_refs).sum(),
+        Value::Array(items) => items.iter_mut().map(strip_schema_refs).sum(),
+        _ => 0,
     }
 }
 
